@@ -16,6 +16,8 @@ from loguru import logger
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 import time
+from bs4 import BeautifulSoup
+import subprocess
 
 
 
@@ -94,33 +96,183 @@ def fetch_papers():
     )
     
     papers = []
-    cutoff_date = datetime.now() - timedelta(days=CONFIG["days_lookback"])
+    # Get the target date (exactly days_lookback days ago)
+    target_date = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=CONFIG["days_lookback"])
     
     for result in client.results(search):
         print(f"Processing paper: {result.title} published on {result.published}")
-        if result.published.replace(tzinfo=None) > cutoff_date:
+        # Check if the paper was published on the target date
+        published_dt = result.published.replace(tzinfo=None)
+        if target_date <= published_dt :
             papers.append({
                 "title": result.title,
                 "url": result.entry_id,
                 "pdf_url": result.pdf_url,
                 "abstract": result.summary,
                 "authors": [a.name for a in result.authors],
-                "published": result.published
+                "published": result.published,
+                "categories": [c for c in result.categories],
+                "primary_category": result.primary_category if result.primary_category else None
             })
-    print(f"Found {len(papers)} papers.")
+    print(f"Found {len(papers)} papers published from {target_date.strftime('%Y-%m-%d')}")
     return papers
 
-def download_pdf(url, filename):
-    response = requests.get(url)
-    with open(filename, 'wb') as f:
-        f.write(response.content)
+def download_pdf(url, filename, max_retries=3):
+    """下载PDF文件，带有重试机制"""
+        # 确保URL是正确的PDF链接
+    if 'arxiv.org' in url and not url.endswith('.pdf'):
+        # 从URL提取论文ID
+        paper_id = url.split('/')[-1]
+        url = f"https://arxiv.org/pdf/{paper_id}.pdf"
+    
+    print(f"尝试下载: {url}")
+    
+    for attempt in range(max_retries):
+        try:
+            response = requests.get(url, timeout=30)  # 添加超时参数
+            
+            # 检查响应是否成功且内容类型是PDF
+            if response.status_code == 200:
+                content_type = response.headers.get('Content-Type', '')
+                if 'pdf' not in content_type.lower() and len(response.content) < 10000:
+                    print(f"警告: 响应可能不是PDF文件 (Content-Type: {content_type})")
+                
+                with open(filename, 'wb') as f:
+                    f.write(response.content)
+                
+                # 验证文件大小
+                file_size = os.path.getsize(filename)
+                if file_size < 1000:  # 小于1KB可能有问题
+                    print(f"警告: 下载的文件过小 ({file_size} 字节)")
+                    continue
+                
+                return True
+            else:
+                print(f"下载失败: HTTP状态码 {response.status_code}")
+        except Exception as e:
+            print(f"尝试 {attempt+1}/{max_retries} 失败: {str(e)}")
+        
+        # 如果不是最后一次尝试，则等待一段时间再重试
+        if attempt < max_retries - 1:
+            time.sleep(2 * (attempt + 1))  # 指数退避
+    
+    return False
 
-def extract_text_from_pdf(pdf_path):
+def extract_text_from_pdf(pdf_path, paper):
+    """从PDF提取文本，增加错误处理"""
     text = ""
-    with open(pdf_path, 'rb') as f:
-        reader = PdfReader(f)
-        for page in reader.pages:
-            text += page.extract_text() + "\n"
+    try:
+        with open(pdf_path, 'rb') as f:
+            try:
+                reader = PdfReader(f)
+                for page_num, page in enumerate(reader.pages):
+                    try:
+                        page_text = page.extract_text()
+                        if page_text:
+                            text += page_text + "\n"
+                    except Exception as e:
+                        print(f"无法提取第 {page_num+1} 页: {str(e)}")
+            except Exception as e:
+                print(f"PDF解析失败: {str(e)}")
+                # 如果是EOF错误，尝试使用另一种方法
+                if "EOF" in str(e):
+                    # 可以尝试使用其他库如pdfminer或pdfplumber
+                    print("尝试备用PDF解析方法")
+                    # 这里可以添加备用解析代码
+    except Exception as e:
+        print(f"无法打开PDF文件: {str(e)}")
+    
+    return text
+
+def download_pdf_and_extract_text(paper):
+    """下载PDF并提取文本，增加错误处理"""
+    pdf_path = f"temp/{paper['title']}.pdf"
+    if download_pdf(paper['pdf_url'], pdf_path):
+        text = extract_text_from_pdf(pdf_path, paper)
+        if not text:
+            print(f"警告: 无法从 {paper['title']} 提取文本")
+        return text
+    else:
+        print(f"错误: 无法下载 {paper['title']} 的PDF")
+        return ""
+
+def download_html_and_extract_text(paper):
+    """从arxiv下载HTML版本，保存为PDF，然后提取文本"""
+    try:
+        # 从paper URL生成HTML链接
+        url = paper['url']
+        if 'arxiv.org' in url:
+            paper_id = url.split('/')[-1]
+            html_url = f"https://arxiv.org/html/{paper_id}"
+        else:
+            html_url = url.replace('.pdf', '.html')
+        
+        print(f"尝试下载HTML: {html_url}")
+        
+        # 下载HTML内容
+        response = requests.get(html_url, timeout=30)
+        
+        if response.status_code == 200:
+            # 创建一个临时HTML文件
+            temp_html_path = f"temp/{paper['title']}_temp.html"
+            with open(temp_html_path, 'wb') as f:
+                f.write(response.content)
+            
+            # 使用wkhtmltopdf将HTML转换为PDF (需要安装wkhtmltopdf)
+            pdf_path = f"temp/{paper['title']}_from_html.pdf"
+            try:
+                subprocess.run(['wkhtmltopdf', temp_html_path, pdf_path], 
+                              check=True, timeout=60)
+                print(f"已将HTML转换为PDF: {pdf_path}")
+                
+                # 尝试从生成的PDF提取文本
+                pdf_text = extract_text_from_pdf(pdf_path, paper)
+                if pdf_text and len(pdf_text) > 1000:
+                    return pdf_text
+            except Exception as pdf_err:
+                print(f"HTML转PDF失败: {str(pdf_err)}")
+            
+            # 如果PDF转换失败或提取文本不足，则直接从HTML提取
+            soup = BeautifulSoup(response.content, 'html.parser')
+            
+            # 移除脚本和样式元素
+            for script in soup(["script", "style"]):
+                script.extract()
+                
+            # 获取文本
+            text = soup.get_text(separator="\n", strip=True)
+            
+            # 处理空白字符
+            lines = (line.strip() for line in text.splitlines())
+            chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
+            text = '\n'.join(chunk for chunk in chunks if chunk)
+            
+            print(f"从HTML提取了 {len(text)} 字符的文本")
+            return text
+        else:
+            print(f"HTML下载失败: HTTP状态码 {response.status_code}")
+            return ""
+    except Exception as e:
+        print(f"HTML处理错误: {str(e)}")
+        return ""
+
+def get_paper_text(paper):
+    """尝试多种方式获取论文文本内容"""
+    # 首先尝试PDF方式
+    text = download_pdf_and_extract_text(paper)
+    
+    # 如果PDF方式失败，尝试HTML方式
+    if not text or len(text) < 1000:  # 内容太少可能是提取失败
+        print(f"PDF提取失败或内容太少，尝试HTML方式")
+        text = download_html_and_extract_text(paper)
+
+    # 如果text长于129024 则截断
+    if len(text) > 129024:
+        print(f"文本内容过长，截断到前129024字符")
+        text = text[:129024]
+    if not text:
+        text = paper['abstract']  # 如果所有方法都失败，使用摘要作为最后的fallback
+    
     return text
 
 def gpt_summarize(text):
@@ -135,7 +287,7 @@ def gpt_summarize(text):
     论文原文内容如下：
     {text}
 
-    请严格按照上述格式输出，注意使用markdown格式进行排版。"""
+    请严格按照上述格式输出，注意使用markdown格式进行排版，不要输出任何额外标记。"""
 
     client = openai.OpenAI(
         base_url=CONFIG["base_url"],
@@ -163,9 +315,7 @@ def daily_job():
     for paper in papers:
         try:
             # 下载并处理PDF
-            pdf_path = f"temp/{paper['title']}.pdf"
-            download_pdf(paper['pdf_url'], pdf_path)
-            text = extract_text_from_pdf(pdf_path)
+            text = get_paper_text(paper)
 
             # GPT总结
             summary = gpt_summarize(text)
@@ -181,6 +331,9 @@ def daily_job():
 * **作者**: {', '.join(paper['authors'])}
 * **发表日期**: {paper['published'].strftime('%Y-%m-%d')}
 * **链接**: [{paper['url']}]({paper['url']})
+* **主要分类**: {paper["primary_category"] if "primary_category" in paper else "未知分类"}
+* **所属分类**: {paper["categories"] if "categories" in paper else "未知分类"}
+
 
 ## 📝 论文总结
 {summary}
@@ -189,6 +342,8 @@ def daily_job():
 """)
         except Exception as e:
             print(f"处理论文失败: {paper['title']}，错误: {str(e)}")
+            # 发送邮件通知处理失败
+            report.append(f"处理论文失败: {paper['title']}，错误: {str(e)}")
     
     if report:
         asyncio.run(send_email("每日ArXiv论文报告", '\n'.join(report)))
@@ -213,7 +368,7 @@ def run_scheduler():
 
 if __name__ == "__main__":
     # 如果需要立即运行一次，取消下面的注释
-    # daily_job()
+    daily_job()
     
     # 启动定时任务
     run_scheduler()
