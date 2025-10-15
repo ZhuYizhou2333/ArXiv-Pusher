@@ -282,6 +282,55 @@ def get_paper_text(paper, user_dir):
 
     return text
 
+def gpt_check_interest(abstract, interest_filter_prompt):
+    """使用GPT判断用户是否对论文感兴趣
+
+    Args:
+        abstract: 论文摘要
+        interest_filter_prompt: 兴趣过滤提示词，需包含{abstract}占位符
+
+    Returns:
+        bool: True表示感兴趣，False表示不感兴趣
+    """
+    prompt = interest_filter_prompt.format(abstract=abstract)
+
+    client = openai.OpenAI(
+        base_url=AI_CONFIG["base_url"],
+        api_key=AI_CONFIG["api_key"]
+    )
+
+    logger.info(f"检查论文兴趣度...")
+    try:
+        response = client.chat.completions.create(
+            model=AI_CONFIG["model"],
+            messages=[{
+                "role": "user",
+                "content": prompt
+            }],
+            temperature=0.3,  # 降低温度以获得更一致的判断
+        )
+
+        answer = response.choices[0].message.content.strip().lower()
+        logger.info(f"兴趣判断结果: {answer}")
+
+        # 判断AI回复是否表示感兴趣
+        # 支持多种可能的回答形式
+        interested = any(keyword in answer for keyword in ['是', 'yes', '感兴趣', '有兴趣', 'interested'])
+        not_interested = any(keyword in answer for keyword in ['否', 'no', '不感兴趣', '无兴趣', 'not interested'])
+
+        if interested and not not_interested:
+            return True
+        elif not_interested and not interested:
+            return False
+        else:
+            # 如果无法明确判断，默认为感兴趣（保守策略）
+            logger.warning(f"无法明确判断兴趣，默认为感兴趣。AI回复: {answer}")
+            return True
+
+    except Exception as e:
+        logger.error(f"兴趣判断失败: {str(e)}，默认为感兴趣")
+        return True  # 出错时默认为感兴趣
+
 def gpt_summarize(text, custom_prompt=None):
     """使用GPT对论文进行总结，支持自定义提示词"""
     # 如果没有自定义提示词，使用默认模板
@@ -320,12 +369,40 @@ def gpt_summarize(text, custom_prompt=None):
             cleaned_content += line + '\n'
     return response.choices[0].message.content
 
+def build_filtered_papers_appendix(filtered_out_papers):
+    """构建被过滤论文的附录
+
+    Args:
+        filtered_out_papers: 被过滤掉的论文列表
+
+    Returns:
+        str: 格式化的附录内容
+    """
+    if not filtered_out_papers:
+        return ""
+
+    appendix = ["\n\n" + "=" * 80]
+    appendix.append("\n## 📋 附录：其他论文（未通过兴趣过滤）")
+    appendix.append("\n以下论文未通过AI兴趣过滤，仅供参考审查：\n")
+
+    for i, paper in enumerate(filtered_out_papers, 1):
+        appendix.append(f"\n### {i}. {paper['title']}\n")
+        appendix.append(f"**作者**: {', '.join(paper['authors'])}\n")
+        appendix.append(f"**发表日期**: {paper['published'].strftime('%Y-%m-%d')}\n")
+        appendix.append(f"**链接**: [{paper['url']}]({paper['url']})\n")
+        appendix.append(f"**主要分类**: {paper.get('primary_category', '未知分类')}\n")
+        appendix.append(f"\n**摘要**:\n{paper['abstract']}\n")
+        appendix.append("\n" + "─" * 80 + "\n")
+
+    return ''.join(appendix)
+
 def process_user(user_config):
     """处理单个用户的论文获取和报告生成"""
     user_name = user_config["name"]
     user_email = user_config["email"]
     arxiv_categories = user_config["arxiv_categories"]
     custom_prompt = user_config.get("custom_prompt", None)
+    interest_filter_prompt = user_config.get("interest_filter_prompt", None)
 
     logger.info(f"开始处理用户: {user_name}")
 
@@ -340,11 +417,41 @@ def process_user(user_config):
         logger.info(f"用户 {user_name} 没有找到新论文")
         return
 
-    # 根据配置限制处理的论文数量
+    # 第一步：如果配置了兴趣过滤提示词，先根据摘要过滤论文
+    filtered_out_papers = []  # 存储被过滤掉的论文
+    if interest_filter_prompt:
+        logger.info(f"开始使用兴趣过滤，共 {len(papers)} 篇论文待过滤")
+        filtered_papers = []
+        for i, paper in enumerate(papers):
+            logger.info(f"过滤论文 {i+1}/{len(papers)}: {paper['title']}")
+            try:
+                is_interested = gpt_check_interest(paper['abstract'], interest_filter_prompt)
+                if is_interested:
+                    filtered_papers.append(paper)
+                    logger.info(f"✓ 用户可能对此论文感兴趣")
+                else:
+                    filtered_out_papers.append(paper)
+                    logger.info(f"✗ 用户可能对此论文不感兴趣，跳过")
+            except Exception as e:
+                logger.error(f"过滤论文时出错: {str(e)}，保留该论文")
+                filtered_papers.append(paper)
+
+        papers = filtered_papers
+        logger.info(f"兴趣过滤完成，剩余 {len(papers)} 篇论文，过滤掉 {len(filtered_out_papers)} 篇论文")
+
+        if not papers:
+            logger.info(f"用户 {user_name} 经过兴趣过滤后没有感兴趣的论文")
+            # 即使没有感兴趣的论文，如果有被过滤的论文，也发送附录
+            if filtered_out_papers:
+                filtered_appendix = build_filtered_papers_appendix(filtered_out_papers)
+                asyncio.run(send_email(f"每日ArXiv论文报告 - {user_name}", filtered_appendix, user_email))
+            return
+
+    # 第二步：根据配置限制处理的论文数量（硬截断）
     max_papers = GENERAL_CONFIG.get("max_papers_per_user", None)
     if max_papers is not None and max_papers > 0:
         papers = papers[:max_papers]
-        logger.info(f"根据配置限制，用户 {user_name} 最多处理 {max_papers} 篇论文")
+        logger.info(f"应用硬截断，用户 {user_name} 最多处理 {max_papers} 篇论文")
 
     report = []
     for paper in papers:
@@ -382,13 +489,20 @@ def process_user(user_config):
             report.append(f"处理论文失败: {paper['title']}，错误: {str(e)}")
 
     if report:
+        # 构建完整报告，包括被过滤论文的附录
+        full_report = '\n'.join(report)
+
+        # 如果有被过滤掉的论文，添加附录
+        if filtered_out_papers:
+            full_report += "\n\n" + build_filtered_papers_appendix(filtered_out_papers)
+
         # 发送给该用户
-        asyncio.run(send_email(f"每日ArXiv论文报告 - {user_name}", '\n'.join(report), user_email))
+        asyncio.run(send_email(f"每日ArXiv论文报告 - {user_name}", full_report, user_email))
 
         # 保存报告到用户专属文件
         report_file = f"{user_dir}/report.md"
         with open(report_file, 'w', encoding='utf-8') as f:
-            f.write('\n'.join(report))
+            f.write(full_report)
         logger.success(f"用户 {user_name} 的报告已发送并保存到 {report_file}")
 
 def daily_job():
