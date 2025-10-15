@@ -340,6 +340,12 @@ def process_user(user_config):
         logger.info(f"用户 {user_name} 没有找到新论文")
         return
 
+    # 根据配置限制处理的论文数量
+    max_papers = GENERAL_CONFIG.get("max_papers_per_user", None)
+    if max_papers is not None and max_papers > 0:
+        papers = papers[:max_papers]
+        logger.info(f"根据配置限制，用户 {user_name} 最多处理 {max_papers} 篇论文")
+
     report = []
     for paper in papers:
         try:
