@@ -5,7 +5,7 @@ from arxiv import Client, Search, SortCriterion, SortOrder
 from PyPDF2 import PdfReader
 import openai
 
-from config import CONFIG, EMAIL_CONFIG
+from config import AI_CONFIG, EMAIL_SERVER_CONFIG, GENERAL_CONFIG, USERS_CONFIG, DEFAULT_PROMPT_TEMPLATE
 
 import smtplib
 import socket
@@ -21,21 +21,21 @@ import subprocess
 
 
 
-async def send_email(subject, content):
+async def send_email(subject, content, receiver_email):
     """发送邮件通知（异步版本）"""
     # 将Markdown内容转换为HTML
     html_content = markdown2.markdown(content, extras=["tables", "mathjax", "fenced-code-blocks"])
     msg = MIMEText(html_content, "html", "utf-8")
     msg["Subject"] = subject
-    msg["From"] = EMAIL_CONFIG["sender"]
-    msg["To"] = EMAIL_CONFIG["receiver"]
+    msg["From"] = EMAIL_SERVER_CONFIG["sender"]
+    msg["To"] = receiver_email
 
     server = None
     try:
-        logger.info("正在连接SMTP服务器...")
+        logger.info(f"正在连接SMTP服务器，发送给 {receiver_email}...")
         # 将SMTP操作放在线程池中执行，以避免阻塞事件循环
         return await asyncio.get_event_loop().run_in_executor(
-            None, lambda: _send_email_sync(msg, server)
+            None, lambda: _send_email_sync(msg, server, receiver_email)
         )
     except Exception as e:
         logger.error(f"邮件发送失败: {str(e)}")
@@ -43,21 +43,21 @@ async def send_email(subject, content):
         return False
 
 
-def _send_email_sync(msg, server=None):
+def _send_email_sync(msg, server=None, receiver_email=None):
     """同步发送邮件的内部函数"""
     try:
         server = smtplib.SMTP(
-            EMAIL_CONFIG["smtp_server"], EMAIL_CONFIG["smtp_port"], timeout=10
+            EMAIL_SERVER_CONFIG["smtp_server"], EMAIL_SERVER_CONFIG["smtp_port"], timeout=10
         )
         server.starttls()  # 启用TLS加密
-        server.login(EMAIL_CONFIG["sender"], EMAIL_CONFIG["password"])
+        server.login(EMAIL_SERVER_CONFIG["sender"], EMAIL_SERVER_CONFIG["password"])
 
-        if EMAIL_CONFIG["receiver"].count(",") > 0:
-            receivers = EMAIL_CONFIG["receiver"].split(",")
-            server.sendmail(EMAIL_CONFIG["sender"], receivers, msg.as_string())
+        if receiver_email.count(",") > 0:
+            receivers = receiver_email.split(",")
+            server.sendmail(EMAIL_SERVER_CONFIG["sender"], receivers, msg.as_string())
         else:
             server.sendmail(
-                EMAIL_CONFIG["sender"], [EMAIL_CONFIG["receiver"]], msg.as_string()
+                EMAIL_SERVER_CONFIG["sender"], [receiver_email], msg.as_string()
             )
 
         logger.success("邮件发送成功")
@@ -82,9 +82,8 @@ def _send_email_sync(msg, server=None):
                 logger.warning(f"关闭SMTP连接时发生错误: {str(e)}")
 
 
-def fetch_papers():
-    # 从配置中获取 arXiv 分类
-    arxiv_categories = CONFIG["arxiv_categories"]
+def fetch_papers(arxiv_categories):
+    """获取指定分类的论文"""
     # 构建搜索查询，只包含配置中的主题
     search_query = " OR ".join([f"cat:{cat}" for cat in arxiv_categories])
     client = Client()  # 创建客户端实例
@@ -94,18 +93,18 @@ def fetch_papers():
         sort_order=SortOrder.Descending,
         max_results=100
     )
-    
+
     papers = []
     # Get the target date (previous workday)
     today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-    target_date = today - timedelta(days=CONFIG["days_lookback"])
-    
+    target_date = today - timedelta(days=GENERAL_CONFIG["days_lookback"])
+
     # Adjust if yesterday was a weekend
     weekday = target_date.weekday()  # 0-6, where 5 is Saturday and 6 is Sunday
     if weekday >= 5:  # If Saturday or Sunday
         # Go back to Friday (4)
         target_date -= timedelta(days=weekday - 4)
-    
+
     logger.info(f"Target date set to previous workday: {target_date.strftime('%Y-%m-%d')}")
     for result in client.results(search):
         logger.info(f"Processing paper: {result.title} published on {result.published}")
@@ -192,9 +191,9 @@ def extract_text_from_pdf(pdf_path, paper):
     
     return text
 
-def download_pdf_and_extract_text(paper):
+def download_pdf_and_extract_text(paper, user_dir):
     """下载PDF并提取文本，增加错误处理"""
-    pdf_path = f"temp/{paper['title']}.pdf"
+    pdf_path = f"{user_dir}/{paper['title']}.pdf"
     if download_pdf(paper['pdf_url'], pdf_path):
         text = extract_text_from_pdf(pdf_path, paper)
         if not text:
@@ -204,7 +203,7 @@ def download_pdf_and_extract_text(paper):
         logger.error(f"错误: 无法下载 {paper['title']} 的PDF")
         return ""
 
-def download_html_and_extract_text(paper):
+def download_html_and_extract_text(paper, user_dir):
     """从arxiv下载HTML版本，保存为PDF，然后提取文本"""
     try:
         # 从paper URL生成HTML链接
@@ -214,20 +213,20 @@ def download_html_and_extract_text(paper):
             html_url = f"https://arxiv.org/html/{paper_id}"
         else:
             html_url = url.replace('.pdf', '.html')
-        
+
         logger.info(f"尝试下载HTML: {html_url}")
-        
+
         # 下载HTML内容
         response = requests.get(html_url, timeout=30)
-        
+
         if response.status_code == 200:
             # 创建一个临时HTML文件
-            temp_html_path = f"temp/{paper['title']}_temp.html"
+            temp_html_path = f"{user_dir}/{paper['title']}_temp.html"
             with open(temp_html_path, 'wb') as f:
                 f.write(response.content)
-            
+
             # 使用wkhtmltopdf将HTML转换为PDF (需要安装wkhtmltopdf)
-            pdf_path = f"temp/{paper['title']}_from_html.pdf"
+            pdf_path = f"{user_dir}/{paper['title']}_from_html.pdf"
             try:
                 subprocess.run(['wkhtmltopdf', temp_html_path, pdf_path],
                               check=True, timeout=60)
@@ -264,15 +263,15 @@ def download_html_and_extract_text(paper):
         logger.error(f"HTML处理错误: {str(e)}")
         return ""
 
-def get_paper_text(paper):
+def get_paper_text(paper, user_dir):
     """尝试多种方式获取论文文本内容"""
     # 首先尝试PDF方式
-    text = download_pdf_and_extract_text(paper)
-    
+    text = download_pdf_and_extract_text(paper, user_dir)
+
     # 如果PDF方式失败，尝试HTML方式
     if not text or len(text) < 1000:  # 内容太少可能是提取失败
         logger.info(f"PDF提取失败或内容太少，尝试HTML方式")
-        text = download_html_and_extract_text(paper)
+        text = download_html_and_extract_text(paper, user_dir)
 
     # 如果text长于129024 则截断
     if len(text) > 129024:
@@ -280,40 +279,26 @@ def get_paper_text(paper):
         text = text[:129024]
     if not text:
         text = paper['abstract']  # 如果所有方法都失败，使用摘要作为最后的fallback
-    
+
     return text
 
-def gpt_summarize(text):
-    prompt = f"""请你担任金融、经济、数学领域学术论文助理，用中文针对下列论文内容进行详细总结，并输出以下结构：
-    1. 中文翻译：对论文摘要进行准确、流畅的中文翻译；
-    2. 创新点：列出 3 个关键创新点，并说明其重要性；
-    3. 理论与方法：详细描述论文采用的主要理论框架，推导步骤和研究方法，必要时可以使用简单的公式；
-    4. 实验与结果：描述论文采取的核心实验设计、数据结果，可以使用表格以清晰地展现不同方法的效果对比；
-    5. 结论与影响：仔细列出论文的所有的关键研究结论；
-    6. 主要参考文献：列举并简要介绍论文中引用的 2-3 篇核心参考文献，并指出其对本研究的贡献。
-
-    论文原文内容如下：
-    {text}
-
-    请严格按照上述格式输出，注意使用markdown格式进行排版。
-    严禁出现使用美元符号$$ 或 $ 包裹的LaTeX风格数学公式。你需要将数学公式使用易于阅读的Unicode符号表示，例如：
-    - 将 ∑_i=1^n 表示为 ∑₁ⁿ
-    - 将 x^2 表示为 x²
-    - 将分数 a/b 表示为 a⁄b 或 a/b
-    - 将积分符号 \int 表示为 ∫
-    - 将偏导数 \partial f/\partial x 表示为 ∂f/∂x
-    - 将希腊字母如 alpha 表示为 α 
-    """
+def gpt_summarize(text, custom_prompt=None):
+    """使用GPT对论文进行总结，支持自定义提示词"""
+    # 如果没有自定义提示词，使用默认模板
+    if custom_prompt:
+        prompt = custom_prompt.format(text=text)
+    else:
+        prompt = DEFAULT_PROMPT_TEMPLATE.format(text=text)
 
     client = openai.OpenAI(
-        base_url=CONFIG["base_url"],
-        api_key=CONFIG["api_key"]
+        base_url=AI_CONFIG["base_url"],
+        api_key=AI_CONFIG["api_key"]
     )
 
     logger.info(f"Requesting GPT to summarize: {text[:100]}...")
     logger.info(f"Request length: {len(text)}")
     response = client.chat.completions.create(
-        model=CONFIG["model"],
+        model=AI_CONFIG["model"],
         messages=[{
             "role": "user",
             "content": prompt
@@ -335,19 +320,34 @@ def gpt_summarize(text):
             cleaned_content += line + '\n'
     return response.choices[0].message.content
 
-def daily_job():
-    os.makedirs('temp', exist_ok=True)
+def process_user(user_config):
+    """处理单个用户的论文获取和报告生成"""
+    user_name = user_config["name"]
+    user_email = user_config["email"]
+    arxiv_categories = user_config["arxiv_categories"]
+    custom_prompt = user_config.get("custom_prompt", None)
+
+    logger.info(f"开始处理用户: {user_name}")
+
+    # 为每个用户创建独立的临时目录
+    user_dir = f"temp/{user_name.replace(' ', '_')}"
+    os.makedirs(user_dir, exist_ok=True)
+
+    # 获取该用户关注的论文
+    papers = fetch_papers(arxiv_categories)
+
+    if not papers:
+        logger.info(f"用户 {user_name} 没有找到新论文")
+        return
+
     report = []
-    papers = fetch_papers()
-    
     for paper in papers:
         try:
             # 下载并处理PDF
-            text = get_paper_text(paper)
+            text = get_paper_text(paper, user_dir)
 
-            # GPT总结
-            summary = gpt_summarize(text)
-            # os.remove(pdf_path)  # 清理临时文件
+            # GPT总结（使用用户自定义提示词）
+            summary = gpt_summarize(text, custom_prompt)
 
             # 构建报告
             report.append(f"""
@@ -361,6 +361,9 @@ def daily_job():
 * **链接**: [{paper['url']}]({paper['url']})
 * **主要分类**: {paper["primary_category"] if "primary_category" in paper else "未知分类"}
 * **所属分类**: {paper["categories"] if "categories" in paper else "未知分类"}
+* **摘要原文**: 
+
+{paper['abstract']}
 
 
 ## 📝 论文总结
@@ -370,14 +373,31 @@ def daily_job():
 """)
         except Exception as e:
             logger.error(f"处理论文失败: {paper['title']}，错误: {str(e)}")
-            # 发送邮件通知处理失败
             report.append(f"处理论文失败: {paper['title']}，错误: {str(e)}")
 
     if report:
-        asyncio.run(send_email("每日ArXiv论文报告", '\n'.join(report)))
-        with open('report.md', 'w', encoding='utf-8') as f:
+        # 发送给该用户
+        asyncio.run(send_email(f"每日ArXiv论文报告 - {user_name}", '\n'.join(report), user_email))
+
+        # 保存报告到用户专属文件
+        report_file = f"{user_dir}/report.md"
+        with open(report_file, 'w', encoding='utf-8') as f:
             f.write('\n'.join(report))
-            logger.success("Reports sent.")
+        logger.success(f"用户 {user_name} 的报告已发送并保存到 {report_file}")
+
+def daily_job():
+    """每日任务：为所有配置的用户处理论文"""
+    os.makedirs('temp', exist_ok=True)
+
+    logger.info(f"开始每日任务，共有 {len(USERS_CONFIG)} 个用户")
+
+    for user_config in USERS_CONFIG:
+        try:
+            process_user(user_config)
+        except Exception as e:
+            logger.error(f"处理用户 {user_config['name']} 时发生错误: {str(e)}")
+
+    logger.success("所有用户处理完成")
 
 def run_scheduler():
     scheduler = BlockingScheduler()
