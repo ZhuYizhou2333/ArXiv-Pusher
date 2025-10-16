@@ -1,3 +1,7 @@
+<div align="center">
+  <img src="icon.jpg" alt="ArXiv Pusher Logo" width="200"/>
+</div>
+
 # ArXiv Pusher
 
 每日自动从 ArXiv 拉取指定分类的最新论文，使用大语言模型进行智能过滤和总结，并将报告推送到您的邮箱。支持多用户配置，每个用户可以自定义关注领域和总结风格。
