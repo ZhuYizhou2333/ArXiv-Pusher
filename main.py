@@ -18,6 +18,7 @@ from apscheduler.triggers.cron import CronTrigger
 import time
 from bs4 import BeautifulSoup
 import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 
@@ -503,25 +504,48 @@ def process_user(user_config):
     # 第一步：如果配置了兴趣过滤提示词，先根据摘要过滤论文
     filtered_out_papers = []  # 存储被过滤掉的论文
     if interest_filter_prompt:
-        logger.info(f"开始使用兴趣过滤，共 {len(papers)} 篇论文待过滤")
+        logger.info(f"开始使用兴趣过滤（并发模式），共 {len(papers)} 篇论文待过滤")
         filtered_papers = []
-        for i, paper in enumerate(papers):
+
+        # 定义单个论文过滤任务
+        def filter_single_paper(paper_with_index):
+            i, paper = paper_with_index
             logger.info(f"过滤论文 {i+1}/{len(papers)}: {paper['title']}")
             try:
                 is_interested, token_stats = gpt_check_interest(paper['abstract'], interest_filter_prompt)
-                # 累计过滤阶段token使用
-                filter_input_tokens += token_stats['prompt_tokens']
-                filter_output_tokens += token_stats['completion_tokens']
-
                 if is_interested:
-                    filtered_papers.append(paper)
                     logger.info(f"✓ 用户可能对此论文感兴趣")
+                    return ('interested', paper, token_stats)
                 else:
-                    filtered_out_papers.append(paper)
                     logger.info(f"✗ 用户可能对此论文不感兴趣，跳过")
+                    return ('not_interested', paper, token_stats)
             except Exception as e:
                 logger.error(f"过滤论文时出错: {str(e)}，保留该论文")
-                filtered_papers.append(paper)
+                return ('error', paper, None)
+
+        # 使用线程池进行并发过滤
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            # 提交所有任务
+            future_to_paper = {executor.submit(filter_single_paper, (i, paper)): paper
+                              for i, paper in enumerate(papers)}
+
+            # 收集结果
+            for future in as_completed(future_to_paper):
+                try:
+                    result_type, paper, token_stats = future.result()
+
+                    # 累计token使用
+                    if token_stats:
+                        filter_input_tokens += token_stats['prompt_tokens']
+                        filter_output_tokens += token_stats['completion_tokens']
+
+                    if result_type == 'interested' or result_type == 'error':
+                        filtered_papers.append(paper)
+                    else:  # not_interested
+                        filtered_out_papers.append(paper)
+
+                except Exception as e:
+                    logger.error(f"处理过滤结果时出错: {str(e)}")
 
         papers = filtered_papers
         logger.info(f"兴趣过滤完成，剩余 {len(papers)} 篇论文，过滤掉 {len(filtered_out_papers)} 篇论文")
