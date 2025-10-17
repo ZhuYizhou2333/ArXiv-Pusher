@@ -290,7 +290,7 @@ def gpt_check_interest(abstract, interest_filter_prompt):
         interest_filter_prompt: 兴趣过滤提示词，需包含{abstract}占位符
 
     Returns:
-        bool: True表示感兴趣，False表示不感兴趣
+        tuple: (bool, dict) 第一个元素表示是否感兴趣，第二个元素为token使用统计
     """
     prompt = interest_filter_prompt.format(abstract=abstract)
 
@@ -310,6 +310,15 @@ def gpt_check_interest(abstract, interest_filter_prompt):
             temperature=0.3,  # 降低温度以获得更一致的判断
         )
 
+        # 记录token使用情况
+        usage = response.usage
+        token_stats = {
+            'prompt_tokens': usage.prompt_tokens,
+            'completion_tokens': usage.completion_tokens,
+            'total_tokens': usage.total_tokens
+        }
+        logger.info(f"Token使用 - 输入: {usage.prompt_tokens}, 输出: {usage.completion_tokens}, 总计: {usage.total_tokens}")
+
         answer = response.choices[0].message.content.strip().lower()
         logger.info(f"兴趣判断结果: {answer}")
 
@@ -319,20 +328,24 @@ def gpt_check_interest(abstract, interest_filter_prompt):
         not_interested = any(keyword in answer for keyword in ['否', 'no', '不感兴趣', '无兴趣', 'not interested'])
 
         if interested and not not_interested:
-            return True
+            return True, token_stats
         elif not_interested and not interested:
-            return False
+            return False, token_stats
         else:
             # 如果无法明确判断，默认为感兴趣（保守策略）
             logger.warning(f"无法明确判断兴趣，默认为感兴趣。AI回复: {answer}")
-            return True
+            return True, token_stats
 
     except Exception as e:
         logger.error(f"兴趣判断失败: {str(e)}，默认为感兴趣")
-        return True  # 出错时默认为感兴趣
+        return True, {'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0}  # 出错时默认为感兴趣
 
 def gpt_summarize(text, custom_prompt=None):
-    """使用GPT对论文进行总结，支持自定义提示词"""
+    """使用GPT对论文进行总结，支持自定义提示词
+
+    Returns:
+        tuple: (str, dict) 第一个元素为总结内容，第二个元素为token使用统计
+    """
     # 如果没有自定义提示词，使用默认模板
     if custom_prompt:
         prompt = custom_prompt.format(text=text)
@@ -354,6 +367,16 @@ def gpt_summarize(text, custom_prompt=None):
         }],
         temperature=1.5,
     )
+
+    # 记录token使用情况
+    usage = response.usage
+    token_stats = {
+        'prompt_tokens': usage.prompt_tokens,
+        'completion_tokens': usage.completion_tokens,
+        'total_tokens': usage.total_tokens
+    }
+    logger.info(f"Token使用 - 输入: {usage.prompt_tokens}, 输出: {usage.completion_tokens}, 总计: {usage.total_tokens}")
+
     logger.info(f"Response: {response.choices[0].message.content[:100]}...")
     logger.info(f"Response length: {len(response.choices[0].message.content)}")
 
@@ -367,7 +390,61 @@ def gpt_summarize(text, custom_prompt=None):
             continue
         if not in_code_block:
             cleaned_content += line + '\n'
-    return response.choices[0].message.content
+    return response.choices[0].message.content, token_stats
+
+def _log_token_cost(user_name, filter_input_tokens, filter_output_tokens,
+                    generate_input_tokens, generate_output_tokens):
+    """记录token使用情况和成本
+
+    Args:
+        user_name: 用户名称
+        filter_input_tokens: 过滤阶段输入token数
+        filter_output_tokens: 过滤阶段输出token数
+        generate_input_tokens: 生成阶段输入token数
+        generate_output_tokens: 生成阶段输出token数
+    """
+    # 分阶段统计
+    filter_total = filter_input_tokens + filter_output_tokens
+    generate_total = generate_input_tokens + generate_output_tokens
+
+    # 总计
+    total_input_tokens = filter_input_tokens + generate_input_tokens
+    total_output_tokens = filter_output_tokens + generate_output_tokens
+    total_tokens = total_input_tokens + total_output_tokens
+
+    # 计算成本（元）
+    filter_input_cost = (filter_input_tokens / 1_000_000) * AI_CONFIG.get("price_per_million_input_tokens", 0)
+    filter_output_cost = (filter_output_tokens / 1_000_000) * AI_CONFIG.get("price_per_million_output_tokens", 0)
+    filter_cost = filter_input_cost + filter_output_cost
+
+    generate_input_cost = (generate_input_tokens / 1_000_000) * AI_CONFIG.get("price_per_million_input_tokens", 0)
+    generate_output_cost = (generate_output_tokens / 1_000_000) * AI_CONFIG.get("price_per_million_output_tokens", 0)
+    generate_cost = generate_input_cost + generate_output_cost
+
+    total_cost = filter_cost + generate_cost
+
+    # 输出统计信息
+    logger.info("=" * 80)
+    logger.info(f"【{user_name}】Token使用统计:")
+    logger.info(f"")
+    logger.info(f"过滤阶段:")
+    logger.info(f"  输入Token: {filter_input_tokens:,}")
+    logger.info(f"  输出Token: {filter_output_tokens:,}")
+    logger.info(f"  小计: {filter_total:,} tokens")
+    logger.info(f"  成本: ¥{filter_cost:.4f}")
+    logger.info(f"")
+    logger.info(f"生成阶段:")
+    logger.info(f"  输入Token: {generate_input_tokens:,}")
+    logger.info(f"  输出Token: {generate_output_tokens:,}")
+    logger.info(f"  小计: {generate_total:,} tokens")
+    logger.info(f"  成本: ¥{generate_cost:.4f}")
+    logger.info(f"")
+    logger.info(f"总计:")
+    logger.info(f"  输入Token: {total_input_tokens:,}")
+    logger.info(f"  输出Token: {total_output_tokens:,}")
+    logger.info(f"  总Token数: {total_tokens:,}")
+    logger.info(f"  总成本: ¥{total_cost:.4f}")
+    logger.info("=" * 80)
 
 def build_filtered_papers_appendix(filtered_out_papers):
     """构建被过滤论文的附录
@@ -406,6 +483,12 @@ def process_user(user_config):
 
     logger.info(f"开始处理用户: {user_name}")
 
+    # 初始化token统计 - 分阶段统计
+    filter_input_tokens = 0
+    filter_output_tokens = 0
+    generate_input_tokens = 0
+    generate_output_tokens = 0
+
     # 为每个用户创建独立的临时目录
     user_dir = f"temp/{user_name.replace(' ', '_')}"
     os.makedirs(user_dir, exist_ok=True)
@@ -425,7 +508,11 @@ def process_user(user_config):
         for i, paper in enumerate(papers):
             logger.info(f"过滤论文 {i+1}/{len(papers)}: {paper['title']}")
             try:
-                is_interested = gpt_check_interest(paper['abstract'], interest_filter_prompt)
+                is_interested, token_stats = gpt_check_interest(paper['abstract'], interest_filter_prompt)
+                # 累计过滤阶段token使用
+                filter_input_tokens += token_stats['prompt_tokens']
+                filter_output_tokens += token_stats['completion_tokens']
+
                 if is_interested:
                     filtered_papers.append(paper)
                     logger.info(f"✓ 用户可能对此论文感兴趣")
@@ -441,6 +528,9 @@ def process_user(user_config):
 
         if not papers:
             logger.info(f"用户 {user_name} 经过兴趣过滤后没有感兴趣的论文")
+            # 输出成本统计
+            _log_token_cost(user_name, filter_input_tokens, filter_output_tokens,
+                           generate_input_tokens, generate_output_tokens)
             # 即使没有感兴趣的论文，如果有被过滤的论文，也发送附录
             if filtered_out_papers:
                 filtered_appendix = build_filtered_papers_appendix(filtered_out_papers)
@@ -460,7 +550,10 @@ def process_user(user_config):
             text = get_paper_text(paper, user_dir)
 
             # GPT总结（使用用户自定义提示词）
-            summary = gpt_summarize(text, custom_prompt)
+            summary, token_stats = gpt_summarize(text, custom_prompt)
+            # 累计生成阶段token使用
+            generate_input_tokens += token_stats['prompt_tokens']
+            generate_output_tokens += token_stats['completion_tokens']
 
             # 构建报告
             report.append(f"""
@@ -474,7 +567,7 @@ def process_user(user_config):
 * **链接**: [{paper['url']}]({paper['url']})
 * **主要分类**: {paper["primary_category"] if "primary_category" in paper else "未知分类"}
 * **所属分类**: {paper["categories"] if "categories" in paper else "未知分类"}
-* **摘要原文**: 
+* **摘要原文**:
 
 {paper['abstract']}
 
@@ -487,6 +580,10 @@ def process_user(user_config):
         except Exception as e:
             logger.error(f"处理论文失败: {paper['title']}，错误: {str(e)}")
             report.append(f"处理论文失败: {paper['title']}，错误: {str(e)}")
+
+    # 输出用户的token使用统计和成本
+    _log_token_cost(user_name, filter_input_tokens, filter_output_tokens,
+                   generate_input_tokens, generate_output_tokens)
 
     if report:
         # 构建完整报告，包括被过滤论文的附录
