@@ -664,7 +664,7 @@ if __name__ == "__main__":
         encoding="utf-8"
     )
     # 如果需要立即运行一次，取消下面的注释
-    daily_job()
+    # daily_job()
     
     # 启动定时任务
     run_scheduler()

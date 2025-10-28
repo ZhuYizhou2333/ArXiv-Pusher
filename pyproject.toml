@@ -1,0 +1,16 @@
+[project]
+name = "arxiv-pusher"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "apscheduler>=3.11.0",
+    "arxiv>=2.2.0",
+    "beautifulsoup4>=4.14.2",
+    "loguru>=0.7.3",
+    "markdown2>=2.5.4",
+    "openai>=2.6.1",
+    "pypdf2>=3.0.1",
+    "requests>=2.32.5",
+]
