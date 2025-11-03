@@ -35,8 +35,16 @@
 
 ## ⚙️ 安装与依赖
 
-### 1. Python 环境
-请确保您已安装 Python 3.7+。
+### 1. 安装 uv
+本项目使用 [uv](https://docs.astral.sh/uv/) 进行依赖管理。首先安装 uv：
+
+```bash
+# macOS/Linux
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Windows
+powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
 
 ### 2. 克隆项目
 ```bash
@@ -44,27 +52,17 @@ git clone <your-repository-url>
 cd ArXiv-Pusher
 ```
 
-### 3. 安装依赖
+### 3. 初始化环境并安装依赖
+使用 uv 自动创建虚拟环境并安装所有依赖（依赖项在 `pyproject.toml` 中定义）：
+
 ```bash
-pip install requests arxiv PyPDF2 openai markdown2 loguru apscheduler beautifulsoup4
+uv sync
 ```
 
-或创建 `requirements.txt` 文件：
-```txt
-requests
-arxiv
-PyPDF2
-openai
-markdown2
-loguru
-apscheduler
-beautifulsoup4
-```
-
-然后安装：
-```bash
-pip install -r requirements.txt
-```
+该命令会：
+- 自动创建 Python 3.12+ 虚拟环境
+- 安装 pyproject.toml 中定义的所有依赖包
+- 生成 uv.lock 锁文件确保依赖版本一致
 
 ### 4. 可选依赖
 如果需要从 HTML 转换 PDF（备用方案），请安装：
@@ -246,7 +244,7 @@ USERS_CONFIG = [
 ### 1. 定时运行（推荐）
 配置好 `config.py` 后，在项目根目录执行：
 ```bash
-python main.py
+uv run main.py
 ```
 
 程序将在每天下午 4:00 自动执行任务（可在 `main.py:410` 修改 `CronTrigger` 的时间）。
@@ -265,8 +263,10 @@ if __name__ == "__main__":
 ### 3. 测试邮件发送
 运行测试脚本：
 ```bash
-python test_email.py
+uv run test_email.py
 ```
+
+> **提示**：`uv run` 会自动激活虚拟环境并运行 Python 脚本，无需手动激活环境。
 
 ## 📄 输出说明
 
