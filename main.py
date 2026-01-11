@@ -6,6 +6,7 @@ from PyPDF2 import PdfReader
 import openai
 
 from config import AI_CONFIG, EMAIL_SERVER_CONFIG, GENERAL_CONFIG, USERS_CONFIG, DEFAULT_PROMPT_TEMPLATE
+from database import get_db
 
 import smtplib
 import socket
@@ -87,7 +88,11 @@ def fetch_papers(arxiv_categories):
     """获取指定分类的论文"""
     # 构建搜索查询，只包含配置中的主题
     search_query = " OR ".join([f"cat:{cat}" for cat in arxiv_categories])
-    client = Client()  # 创建客户端实例
+    client = Client(
+        page_size=50,  # 减小每页大小
+        delay_seconds=3,  # 增加请求间隔到3秒，避免被限流
+        num_retries=5  # 增加重试次数
+    )
     search = Search(
         query=search_query,
         sort_by=SortCriterion.SubmittedDate,
@@ -490,12 +495,18 @@ def process_user(user_config):
     generate_input_tokens = 0
     generate_output_tokens = 0
 
+    # 初始化论文数量统计
+    papers_fetched = 0
+    papers_filtered_count = 0
+    papers_processed_count = 0
+
     # 为每个用户创建独立的临时目录
     user_dir = f"temp/{user_name.replace(' ', '_')}"
     os.makedirs(user_dir, exist_ok=True)
 
     # 获取该用户关注的论文
     papers = fetch_papers(arxiv_categories)
+    papers_fetched = len(papers)
 
     if not papers:
         logger.info(f"用户 {user_name} 没有找到新论文")
@@ -523,8 +534,8 @@ def process_user(user_config):
                 logger.error(f"过滤论文时出错: {str(e)}，保留该论文")
                 return ('error', paper, None)
 
-        # 使用线程池进行并发过滤
-        with ThreadPoolExecutor(max_workers=10) as executor:
+        # 使用线程池进行并发过滤（降低并发数避免API限流）
+        with ThreadPoolExecutor(max_workers=3) as executor:
             # 提交所有任务
             future_to_paper = {executor.submit(filter_single_paper, (i, paper)): paper
                               for i, paper in enumerate(papers)}
@@ -548,10 +559,36 @@ def process_user(user_config):
                     logger.error(f"处理过滤结果时出错: {str(e)}")
 
         papers = filtered_papers
+        papers_filtered_count = len(papers)
         logger.info(f"兴趣过滤完成，剩余 {len(papers)} 篇论文，过滤掉 {len(filtered_out_papers)} 篇论文")
 
         if not papers:
             logger.info(f"用户 {user_name} 经过兴趣过滤后没有感兴趣的论文")
+            # 计算成本
+            filter_input_cost = (filter_input_tokens / 1_000_000) * AI_CONFIG.get("price_per_million_input_tokens", 0)
+            filter_output_cost = (filter_output_tokens / 1_000_000) * AI_CONFIG.get("price_per_million_output_tokens", 0)
+            filter_cost = filter_input_cost + filter_output_cost
+
+            # 记录到数据库
+            try:
+                db = get_db()
+                db.record_usage(
+                    user_name=user_name,
+                    user_email=user_email,
+                    arxiv_categories=arxiv_categories,
+                    filter_input_tokens=filter_input_tokens,
+                    filter_output_tokens=filter_output_tokens,
+                    generate_input_tokens=0,
+                    generate_output_tokens=0,
+                    filter_cost=filter_cost,
+                    generate_cost=0.0,
+                    papers_fetched=papers_fetched,
+                    papers_filtered=0,
+                    papers_processed=0
+                )
+            except Exception as e:
+                logger.error(f"记录数据库失败: {str(e)}")
+
             # 输出成本统计
             _log_token_cost(user_name, filter_input_tokens, filter_output_tokens,
                            generate_input_tokens, generate_output_tokens)
@@ -560,6 +597,9 @@ def process_user(user_config):
                 filtered_appendix = build_filtered_papers_appendix(filtered_out_papers)
                 asyncio.run(send_email(f"每日ArXiv论文报告 - {user_name}", filtered_appendix, user_email))
             return
+    else:
+        # 没有配置兴趣过滤，所有论文都通过
+        papers_filtered_count = len(papers)
 
     # 第二步：根据配置限制处理的论文数量（硬截断）
     max_papers = GENERAL_CONFIG.get("max_papers_per_user", None)
@@ -568,6 +608,7 @@ def process_user(user_config):
         logger.info(f"应用硬截断，用户 {user_name} 最多处理 {max_papers} 篇论文")
 
     report = []
+    papers_processed_count = 0
     for paper in papers:
         try:
             # 下载并处理PDF
@@ -578,6 +619,7 @@ def process_user(user_config):
             # 累计生成阶段token使用
             generate_input_tokens += token_stats['prompt_tokens']
             generate_output_tokens += token_stats['completion_tokens']
+            papers_processed_count += 1
 
             # 构建报告
             report.append(f"""
@@ -609,6 +651,35 @@ def process_user(user_config):
     _log_token_cost(user_name, filter_input_tokens, filter_output_tokens,
                    generate_input_tokens, generate_output_tokens)
 
+    # 计算成本
+    filter_input_cost = (filter_input_tokens / 1_000_000) * AI_CONFIG.get("price_per_million_input_tokens", 0)
+    filter_output_cost = (filter_output_tokens / 1_000_000) * AI_CONFIG.get("price_per_million_output_tokens", 0)
+    filter_cost = filter_input_cost + filter_output_cost
+
+    generate_input_cost = (generate_input_tokens / 1_000_000) * AI_CONFIG.get("price_per_million_input_tokens", 0)
+    generate_output_cost = (generate_output_tokens / 1_000_000) * AI_CONFIG.get("price_per_million_output_tokens", 0)
+    generate_cost = generate_input_cost + generate_output_cost
+
+    # 记录到数据库
+    try:
+        db = get_db()
+        db.record_usage(
+            user_name=user_name,
+            user_email=user_email,
+            arxiv_categories=arxiv_categories,
+            filter_input_tokens=filter_input_tokens,
+            filter_output_tokens=filter_output_tokens,
+            generate_input_tokens=generate_input_tokens,
+            generate_output_tokens=generate_output_tokens,
+            filter_cost=filter_cost,
+            generate_cost=generate_cost,
+            papers_fetched=papers_fetched,
+            papers_filtered=papers_filtered_count,
+            papers_processed=papers_processed_count
+        )
+    except Exception as e:
+        logger.error(f"记录数据库失败: {str(e)}")
+
     if report:
         # 构建完整报告，包括被过滤论文的附录
         full_report = '\n'.join(report)
@@ -632,9 +703,13 @@ def daily_job():
 
     logger.info(f"开始每日任务，共有 {len(USERS_CONFIG)} 个用户")
 
-    for user_config in USERS_CONFIG:
+    for i, user_config in enumerate(USERS_CONFIG):
         try:
             process_user(user_config)
+            # 在处理用户之间添加延迟，避免ArXiv API限流
+            if i < len(USERS_CONFIG) - 1:
+                logger.info(f"等待60秒后处理下一个用户，避免API限流...")
+                time.sleep(60)
         except Exception as e:
             logger.error(f"处理用户 {user_config['name']} 时发生错误: {str(e)}")
 
