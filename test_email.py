@@ -1,6 +1,5 @@
 from main import send_email
 
-from config import EMAIL_CONFIG
 import asyncio
 
 if __name__ == "__main__":
