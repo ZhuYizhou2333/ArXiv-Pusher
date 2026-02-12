@@ -13,4 +13,5 @@ dependencies = [
     "openai>=2.6.1",
     "pypdf2>=3.0.1",
     "requests>=2.32.5",
+    "latex2mathml>=3.78.1"
 ]

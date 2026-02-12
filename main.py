@@ -25,7 +25,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 async def send_email(subject, content, receiver_email):
     """发送邮件通知（异步版本）"""
     # 将Markdown内容转换为HTML
-    html_content = markdown2.markdown(content, extras=["tables", "mathjax", "fenced-code-blocks"])
+    html_content = markdown2.markdown(content, extras=["tables", "latex", "fenced-code-blocks"])
     msg = MIMEText(html_content, "html", "utf-8")
     msg["Subject"] = subject
     msg["From"] = EMAIL_SERVER_CONFIG["sender"]
